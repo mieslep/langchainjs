@@ -6,8 +6,12 @@ import {
   AsyncCallerParams,
 } from "@langchain/core/utils/async_caller";
 import { Embeddings } from "@langchain/core/embeddings";
-import { VectorStore } from "@langchain/core/vectorstores";
+import { 
+  VectorStore,
+  MaxMarginalRelevanceSearchOptions,
+ } from "@langchain/core/vectorstores";
 import { Document } from "@langchain/core/documents";
+import { maximalMarginalRelevance } from "@langchain/core/utils/math";
 
 export interface Column {
   type: string;
@@ -80,6 +84,8 @@ export class CassandraStore extends VectorStore {
   asyncCaller: AsyncCaller;
 
   private readonly batchSize: number;
+
+  private readonly embeddingColumnAlias = "embedding";
 
   _vectorstoreType(): string {
     return "cassandra";
@@ -158,20 +164,22 @@ export class CassandraStore extends VectorStore {
    * Method to search for vectors that are similar to a given query vector.
    * @param query The query vector.
    * @param k The number of similar vectors to return.
-   * @param filter
+   * @param filter Optional filter to be applied as a WHERE clause.
+   * @param includeEmbedding Whether to include the embedding vectors in the results.
    * @returns Promise that resolves with an array of tuples, each containing a Document and a score.
    */
   async similaritySearchVectorWithScore(
     query: number[],
     k: number,
-    filter?: WhereClause
+    filter?: WhereClause,
+    includeEmbedding?: boolean
   ): Promise<[Document, number][]> {
     await this.initialize();
 
     // Ensure we have an array of Filter from the public interface
     const filters = this.asFilters(filter);
 
-    const queryStr = this.buildSearchQuery(filters);
+    const queryStr = this.buildSearchQuery(filters, includeEmbedding);
 
     // Search query will be of format:
     //   SELECT ..., text, similarity_x(?) AS similarity_score
@@ -207,6 +215,10 @@ export class CassandraStore extends VectorStore {
       delete sanitizedRow.text;
       delete sanitizedRow.similarity_score;
 
+      if (includeEmbedding && sanitizedRow[this.embeddingColumnAlias]) {
+        sanitizedRow[this.embeddingColumnAlias] = Object.values(sanitizedRow[this.embeddingColumnAlias]);
+      }
+  
       Object.keys(sanitizedRow).forEach((key) => {
         if (sanitizedRow[key] === null) {
           delete sanitizedRow[key];
@@ -217,6 +229,50 @@ export class CassandraStore extends VectorStore {
         new Document({ pageContent: textContent, metadata: sanitizedRow }),
         row.similarity_score,
       ];
+    });
+  }
+
+
+  /**
+   * Method to search for vectors that are similar to a given query vector, but with
+   * the results selected using the maximal marginal relevance.
+   * @param query The query string.
+   * @param options.k The number of similar documents to return.
+   * @param options.fetchK=4*k The number of records to fetch before passing to the MMR algorithm.
+   * @param options.lambda=0.5 The degree of diversity among the results between 0 (maximum diversity) and 1 (minimum diversity).
+   * @param options.filter Optional filter to be applied as a WHERE clause.
+   * @returns List of documents selected by maximal marginal relevance.
+   */
+  async maxMarginalRelevanceSearch(
+    query: string,
+    options: MaxMarginalRelevanceSearchOptions<this["FilterType"]>
+  ): Promise<Document[]> {
+    const { k, fetchK = 4 * k, lambda = 0.5, filter } = options;
+
+    const queryEmbedding = await this.embeddings.embedQuery(query);
+
+    const queryResults = await this.similaritySearchVectorWithScore(
+      queryEmbedding,
+      fetchK,
+      filter,
+      true
+    );
+
+    const embeddingList = queryResults.map(
+      (doc) => doc[0].metadata[this.embeddingColumnAlias]
+    );
+
+    const mmrIndexes = maximalMarginalRelevance(
+      queryEmbedding,
+      embeddingList,
+      lambda,
+      k
+    );
+
+    return mmrIndexes.map((idx) => {
+      const doc = queryResults[idx][0];
+      delete doc.metadata[this.embeddingColumnAlias];
+      return doc;
     });
   }
 
@@ -506,13 +562,20 @@ export class CassandraStore extends VectorStore {
    * Cassandra database.
    * @param query The query vector.
    * @param k The number of similar vectors to return.
-   * @param filters
+   * @param filters Optional filters to be applied as a WHERE clause.
+   * @param includeEmbedding Whether to include the embedding vectors in the results.
    * @returns The CQL query string.
    */
-  private buildSearchQuery(filters: Filter[]): string {
+  private buildSearchQuery(
+    filters: Filter[],
+    includeEmbedding = false
+  ): string {
     const whereClause = filters ? this.buildWhereClause(filters) : "";
+    const embeddingColumn = includeEmbedding
+      ? `, vector AS ${this.embeddingColumnAlias}`
+      : "";
 
-    const cqlQuery = `SELECT ${this.selectColumns}, text, similarity_${this.vectorType}(vector, ?) AS similarity_score
+    const cqlQuery = `SELECT ${this.selectColumns}, text, similarity_${this.vectorType}(vector, ?) AS similarity_score ${embeddingColumn}
                         FROM ${this.keyspace}.${this.table} ${whereClause} ORDER BY vector ANN OF ? LIMIT ?`;
 
     return cqlQuery;
