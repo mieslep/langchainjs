@@ -1,15 +1,18 @@
 /* eslint-disable prefer-template */
 import { Client as CassandraClient, DseClientOptions } from "cassandra-driver";
+import fs from "node:fs/promises";
+import * as path from "node:path";
+import * as os from "node:os";
 
 import {
   AsyncCaller,
   AsyncCallerParams,
 } from "@langchain/core/utils/async_caller";
 import { Embeddings } from "@langchain/core/embeddings";
-import { 
+import {
   VectorStore,
   MaxMarginalRelevanceSearchOptions,
- } from "@langchain/core/vectorstores";
+} from "@langchain/core/vectorstores";
 import { Document } from "@langchain/core/documents";
 import { maximalMarginalRelevance } from "@langchain/core/utils/math";
 
@@ -35,7 +38,21 @@ export type WhereClause = Filter[] | Filter | Record<string, unknown>;
 
 export type SupportedVectorTypes = "cosine" | "dot_product" | "euclidean";
 
-export interface CassandraLibArgs extends DseClientOptions, AsyncCallerParams {
+export interface AstraServiceProviderArgs {
+  datacenterID: string;
+  token: string;
+  regionName?: string;
+}
+
+export interface CassandraServiceProviderArgs {
+  astra?: AstraServiceProviderArgs;
+}
+
+export interface ClientArgs extends DseClientOptions {
+  serviceProviderArgs?: CassandraServiceProviderArgs;
+}
+
+export interface CassandraLibArgs extends ClientArgs, AsyncCallerParams {
   table: string;
   keyspace: string;
   vectorType?: SupportedVectorTypes;
@@ -107,7 +124,7 @@ export class CassandraStore extends VectorStore {
       metadataColumns,
     } = args;
 
-    const argsWithDefaults = {
+    this.constructorArgs = {
       ...args,
       indices,
       maxConcurrency,
@@ -115,8 +132,8 @@ export class CassandraStore extends VectorStore {
       batchSize,
       vectorType,
     };
-    this.asyncCaller = new AsyncCaller(argsWithDefaults);
-    this.client = new CassandraClient(argsWithDefaults);
+
+    this.asyncCaller = new AsyncCaller(this.constructorArgs);
 
     // Assign properties
     this.vectorType = vectorType;
@@ -216,9 +233,11 @@ export class CassandraStore extends VectorStore {
       delete sanitizedRow.similarity_score;
 
       if (includeEmbedding && sanitizedRow[this.embeddingColumnAlias]) {
-        sanitizedRow[this.embeddingColumnAlias] = Object.values(sanitizedRow[this.embeddingColumnAlias]);
+        sanitizedRow[this.embeddingColumnAlias] = Object.values(
+          sanitizedRow[this.embeddingColumnAlias]
+        );
       }
-  
+
       Object.keys(sanitizedRow).forEach((key) => {
         if (sanitizedRow[key] === null) {
           delete sanitizedRow[key];
@@ -231,7 +250,6 @@ export class CassandraStore extends VectorStore {
       ];
     });
   }
-
 
   /**
    * Method to search for vectors that are similar to a given query vector, but with
@@ -368,6 +386,8 @@ export class CassandraStore extends VectorStore {
    * Method to perform the initialization tasks
    */
   private async performInitialization() {
+    this.client = await CassandraStore.getClient(this.constructorArgs);
+
     let cql = "";
     cql = `CREATE TABLE IF NOT EXISTS ${this.keyspace}.${this.table} (
       ${this.primaryKey.map((col) => `${col.name} ${col.type}`).join(", ")}
@@ -711,5 +731,124 @@ export class CassandraStore extends VectorStore {
 
     // Wait for all insert operations to complete.
     await Promise.all(insertPromises);
+  }
+
+  /**
+   * Method to get the CassandraClient
+   * @param argsWithDefaults connection arguments
+   * @returns CassandraClient object
+   */
+  static async getClient(
+    args: ClientArgs
+  ): Promise<CassandraClient> {
+    if (!args.serviceProviderArgs) {
+      return new CassandraClient(args);
+    }
+
+    if (args.serviceProviderArgs.astra) {
+      return CassandraStore.getAstraClient(args);
+    }
+
+    throw new Error("Unsupported configuration for Cassandra client.");
+  }
+
+  static async getAstraClient(
+    args: CassandraServiceProviderArgs
+  ): Promise<CassandraClient> {
+    if (!args.serviceProviderArgs.astra) {
+      throw new Error(
+        "Astra configuration is not provided in serviceProviderArgs."
+      );
+    }
+
+    // Create a copy of args to avoid direct modification
+    const modifiedArgs = { ...args };
+
+    // If the secureConnectBundle is specified, use it to connect to the database
+    if (modifiedArgs.cloud && modifiedArgs.cloud.secureConnectBundle) {
+      if (!modifiedArgs.credentials) {
+        modifiedArgs.credentials = {
+          username: "token",
+          password: modifiedArgs.serviceProviderArgs.astra.token,
+        };
+      }
+      return new CassandraClient(modifiedArgs);
+    } else {
+      // Store the secureConnectBundle in a temporary file, named uniquely with datacenterID and optional regionName
+      const dir = path.join(os.tmpdir(), "cassandra-astra");
+      await fs.mkdir(dir, { recursive: true });
+
+      let scbFileName = `astra-secure-connect-${modifiedArgs.serviceProviderArgs.astra.datacenterID}`;
+      if (modifiedArgs.serviceProviderArgs.astra.regionName) {
+        scbFileName += `-${modifiedArgs.serviceProviderArgs.astra.regionName}`;
+      }
+      scbFileName += ".zip";
+      const scbPath = path.join(dir, scbFileName);
+
+      // Check if the file exists, and if not, download it
+      try {
+        await fs.access(scbPath);
+      } catch (error) {
+        if (error.code === "ENOENT") {
+          const bundleURLTemplate =
+            "https://api.astra.datastax.com/v2/databases/{database_id}/secureBundleURL?all=true";
+          const url = bundleURLTemplate.replace(
+            "{database_id}",
+            modifiedArgs.serviceProviderArgs.astra.datacenterID
+          );
+
+          // POST request to get the list of URLs
+          const postResponse = await fetch(url, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${modifiedArgs.serviceProviderArgs.astra.token}`,
+              "Content-Type": "application/json",
+            },
+          });
+
+          if (!postResponse.ok) {
+            throw new Error(`HTTP error! Status: ${postResponse.status}`);
+          }
+
+          const postData = await postResponse.json();
+
+          if (postData && Array.isArray(postData) && postData.length > 0) {
+            let downloadURL;
+            if (args.serviceProviderArgs.astra.regionName) {
+              const regionalBundle = postData.find(
+                (bundle) =>
+                  bundle.region === args.serviceProviderArgs.astra.regionName
+              );
+              if (regionalBundle) {
+                downloadURL = regionalBundle.downloadURL;
+              } else {
+                throw new Error(
+                  `No secure bundle found for region: ${args.serviceProviderArgs.astra.regionName}`
+                );
+              }
+            } else {
+              downloadURL = postData[0].downloadURL;
+            }
+
+            // GET request to download the file
+            const getResponse = await fetch(downloadURL);
+            if (!getResponse.ok) {
+              throw new Error(`HTTP error! Status: ${getResponse.status}`);
+            }
+            const bundleData = await getResponse.arrayBuffer();
+            await fs.writeFile(scbPath, Buffer.from(bundleData));
+          }
+        } else {
+          throw error;
+        }
+      }
+
+      if (!modifiedArgs.cloud) {
+        modifiedArgs.cloud = {};
+      }
+      modifiedArgs.cloud.secureConnectBundle = scbPath;
+
+      return CassandraStore.getAstraClient(modifiedArgs);
+    }
   }
 }
