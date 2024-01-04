@@ -308,8 +308,6 @@ describe.skip("CassandraStore - no explicit partition key", () => {
       lambda: 0,
     });
 
-    console.log(`results: ${JSON.stringify(results)}`);
-
     // Check that the results array has exactly two documents.
     expect(results.length).toEqual(2);
 

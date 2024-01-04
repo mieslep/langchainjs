@@ -94,8 +94,6 @@ export class CassandraStore extends VectorStore {
 
   private indices: Index[];
 
-  private initializationState = 0; // 0: Not Initialized, 1: In Progress, 2: Initialized
-
   private initializationPromise: Promise<void> | null = null;
 
   asyncCaller: AsyncCaller;
@@ -103,6 +101,8 @@ export class CassandraStore extends VectorStore {
   private readonly batchSize: number;
 
   private readonly embeddingColumnAlias = "embedding";
+
+  private constructorArgs: CassandraLibArgs;
 
   _vectorstoreType(): string {
     return "cassandra";
@@ -363,21 +363,21 @@ export class CassandraStore extends VectorStore {
    * @returns Promise that resolves when the database has been initialized.
    */
   private async initialize(): Promise<void> {
-    if (this.initializationState === 2) {
-      // Already initialized
-      return Promise.resolve();
-    }
-
-    if (this.initializationState === 1 && this.initializationPromise) {
-      // Initialization in progress, wait for it to complete
+    // If already initialized or initialization is in progress, return the existing promise
+    if (this.initializationPromise) {
       return this.initializationPromise;
     }
 
-    // Start the initialization process
-    this.initializationState = 1;
-    this.initializationPromise = new Promise((resolve, reject) => {
-      this.performInitialization().then(resolve).catch(reject);
-    });
+    // Start the initialization process and store the promise
+    this.initializationPromise = this.performInitialization()
+      .then(() => {
+        // Initialization successful
+      })
+      .catch((error) => {
+        // Reset to allow retrying in case of failure
+        this.initializationPromise = null;
+        throw error;
+      });
 
     return this.initializationPromise;
   }
@@ -443,8 +443,6 @@ export class CassandraStore extends VectorStore {
              ON ${this.keyspace}.${this.table} ${value} USING 'StorageAttachedIndex' ${optionsClause};`;
       await this.client.execute(cql);
     }
-
-    this.initializationState = 2; // Mark as initialized
   }
 
   /**
@@ -738,24 +736,21 @@ export class CassandraStore extends VectorStore {
    * @param argsWithDefaults connection arguments
    * @returns CassandraClient object
    */
-  static async getClient(
-    args: ClientArgs
-  ): Promise<CassandraClient> {
+  static async getClient(args: ClientArgs): Promise<CassandraClient> {
     if (!args.serviceProviderArgs) {
       return new CassandraClient(args);
     }
 
-    if (args.serviceProviderArgs.astra) {
+    if (args.serviceProviderArgs && args.serviceProviderArgs.astra) {
       return CassandraStore.getAstraClient(args);
     }
 
     throw new Error("Unsupported configuration for Cassandra client.");
   }
 
-  static async getAstraClient(
-    args: CassandraServiceProviderArgs
-  ): Promise<CassandraClient> {
-    if (!args.serviceProviderArgs.astra) {
+  static async getAstraClient(args: ClientArgs): Promise<CassandraClient> {
+    const astraConfig = args.serviceProviderArgs?.astra;
+    if (!astraConfig) {
       throw new Error(
         "Astra configuration is not provided in serviceProviderArgs."
       );
@@ -764,44 +759,38 @@ export class CassandraStore extends VectorStore {
     // Create a copy of args to avoid direct modification
     const modifiedArgs = { ...args };
 
-    // If the secureConnectBundle is specified, use it to connect to the database
-    if (modifiedArgs.cloud && modifiedArgs.cloud.secureConnectBundle) {
-      if (!modifiedArgs.credentials) {
-        modifiedArgs.credentials = {
-          username: "token",
-          password: modifiedArgs.serviceProviderArgs.astra.token,
-        };
-      }
-      return new CassandraClient(modifiedArgs);
-    } else {
-      // Store the secureConnectBundle in a temporary file, named uniquely with datacenterID and optional regionName
+    // Initialize cloud if it's not already defined
+    modifiedArgs.cloud = modifiedArgs.cloud || { secureConnectBundle: "" };
+
+    if (!modifiedArgs.cloud.secureConnectBundle) {
+      // Store the secureConnectBundle in a temporary file
       const dir = path.join(os.tmpdir(), "cassandra-astra");
       await fs.mkdir(dir, { recursive: true });
 
-      let scbFileName = `astra-secure-connect-${modifiedArgs.serviceProviderArgs.astra.datacenterID}`;
-      if (modifiedArgs.serviceProviderArgs.astra.regionName) {
-        scbFileName += `-${modifiedArgs.serviceProviderArgs.astra.regionName}`;
+      let scbFileName = `astra-secure-connect-${astraConfig.datacenterID}`;
+      if (astraConfig.regionName) {
+        scbFileName += `-${astraConfig.regionName}`;
       }
       scbFileName += ".zip";
       const scbPath = path.join(dir, scbFileName);
 
-      // Check if the file exists, and if not, download it
+      // Try accessing the file, if it doesn't exist, download it
       try {
         await fs.access(scbPath);
-      } catch (error) {
-        if (error.code === "ENOENT") {
+      } catch (error: unknown) {
+        // Handle file not found error (ENOENT)
+        if (typeof error === "object" && error !== null && "code" in error) {
+          // Download secure connect bundle
           const bundleURLTemplate =
             "https://api.astra.datastax.com/v2/databases/{database_id}/secureBundleURL?all=true";
           const url = bundleURLTemplate.replace(
             "{database_id}",
-            modifiedArgs.serviceProviderArgs.astra.datacenterID
+            astraConfig.datacenterID
           );
-
-          // POST request to get the list of URLs
           const postResponse = await fetch(url, {
             method: "POST",
             headers: {
-              Authorization: `Bearer ${modifiedArgs.serviceProviderArgs.astra.token}`,
+              Authorization: `Bearer ${astraConfig.token}`,
               "Content-Type": "application/json",
             },
           });
@@ -811,44 +800,43 @@ export class CassandraStore extends VectorStore {
           }
 
           const postData = await postResponse.json();
-
-          if (postData && Array.isArray(postData) && postData.length > 0) {
-            let downloadURL;
-            if (args.serviceProviderArgs.astra.regionName) {
-              const regionalBundle = postData.find(
-                (bundle) =>
-                  bundle.region === args.serviceProviderArgs.astra.regionName
-              );
-              if (regionalBundle) {
-                downloadURL = regionalBundle.downloadURL;
-              } else {
-                throw new Error(
-                  `No secure bundle found for region: ${args.serviceProviderArgs.astra.regionName}`
-                );
-              }
-            } else {
-              downloadURL = postData[0].downloadURL;
-            }
-
-            // GET request to download the file
-            const getResponse = await fetch(downloadURL);
-            if (!getResponse.ok) {
-              throw new Error(`HTTP error! Status: ${getResponse.status}`);
-            }
-            const bundleData = await getResponse.arrayBuffer();
-            await fs.writeFile(scbPath, Buffer.from(bundleData));
+          if (!postData || !Array.isArray(postData) || postData.length === 0) {
+            throw new Error("Failed to get secure bundle URL.");
           }
+
+          let { downloadURL } = postData[0];
+          if (astraConfig.regionName) {
+            const regionalBundle = postData.find(
+              (bundle) => bundle.region === astraConfig.regionName
+            );
+            if (regionalBundle) {
+              downloadURL = regionalBundle.downloadURL;
+            }
+          }
+
+          // GET request to download the file
+          const getResponse = await fetch(downloadURL);
+          if (!getResponse.ok) {
+            throw new Error(`HTTP error! Status: ${getResponse.status}`);
+          }
+          const bundleData = await getResponse.arrayBuffer();
+          await fs.writeFile(scbPath, Buffer.from(bundleData));
         } else {
           throw error;
         }
       }
 
-      if (!modifiedArgs.cloud) {
-        modifiedArgs.cloud = {};
-      }
       modifiedArgs.cloud.secureConnectBundle = scbPath;
-
-      return CassandraStore.getAstraClient(modifiedArgs);
     }
+
+    // Ensure credentials are set
+    if (!modifiedArgs.credentials) {
+      modifiedArgs.credentials = {
+        username: "token",
+        password: astraConfig.token,
+      };
+    }
+
+    return new CassandraClient(modifiedArgs);
   }
 }
